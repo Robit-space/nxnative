@@ -1,0 +1,154 @@
+
+name: iOS 16 Legacy Metal Probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: xcode-27
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Create probe project
+        run: |
+          mkdir -p probe/Sources
+          cat > probe/project.yml <<'YAML'
+          name: LegacyMetalProbe
+          options:
+            deploymentTarget:
+              iOS: "16.1"
+          targets:
+            LegacyMetalProbe:
+              type: application
+              platform: iOS
+              sources:
+                - Sources
+              settings:
+                base:
+                  PRODUCT_BUNDLE_IDENTIFIER: org.nxnative.legacy-metal-probe
+                  SWIFT_VERSION: "5.0"
+                  TARGETED_DEVICE_FAMILY: "1,2"
+                  GENERATE_INFOPLIST_FILE: YES
+                  INFOPLIST_KEY_CFBundleDisplayName: "Legacy Metal Probe"
+                  CODE_SIGNING_ALLOWED: NO
+          YAML
+
+          cat > probe/Sources/Probe.swift <<'SWIFT'
+          import SwiftUI
+          import Metal
+          import MetalKit
+          import UIKit
+
+          @main
+          struct ProbeApp: App {
+              var body: some Scene {
+                  WindowGroup { ContentView() }
+              }
+          }
+
+          struct ContentView: View {
+              let device = MTLCreateSystemDefaultDevice()
+
+              var body: some View {
+                  VStack(spacing: 18) {
+                      Text("Legacy Metal Probe")
+                          .font(.title.bold())
+                      Text("iOS: \(UIDevice.current.systemVersion)")
+                      Text("GPU: \(device?.name ?? "Unavailable")")
+
+                      if device != nil {
+                          MetalView()
+                              .frame(height: 280)
+                              .clipShape(RoundedRectangle(cornerRadius: 16))
+                          Text("Metal rendering test")
+                      } else {
+                          Text("Metal device unavailable")
+                              .foregroundColor(.red)
+                      }
+                      Spacer()
+                  }
+                  .padding()
+              }
+          }
+
+          struct MetalView: UIViewRepresentable {
+              func makeCoordinator() -> Coordinator {
+                  Coordinator()
+              }
+
+              func makeUIView(context: Context) -> MTKView {
+                  let view = MTKView(
+                      frame: .zero,
+                      device: MTLCreateSystemDefaultDevice()
+                  )
+                  view.clearColor = MTLClearColor(
+                      red: 0.08, green: 0.24, blue: 0.48, alpha: 1
+                  )
+                  view.delegate = context.coordinator
+                  view.preferredFramesPerSecond = 30
+                  return view
+              }
+
+              func updateUIView(_ view: MTKView, context: Context) {}
+
+              final class Coordinator: NSObject, MTKViewDelegate {
+                  let queue = MTLCreateSystemDefaultDevice()?.makeCommandQueue()
+
+                  func mtkView(
+                      _ view: MTKView,
+                      drawableSizeWillChange size: CGSize
+                  ) {}
+
+                  func draw(in view: MTKView) {
+                      guard
+                          let pass = view.currentRenderPassDescriptor,
+                          let drawable = view.currentDrawable,
+                          let command = queue?.makeCommandBuffer(),
+                          let encoder = command.makeRenderCommandEncoder(
+                              descriptor: pass
+                          )
+                      else { return }
+
+                      encoder.endEncoding()
+                      command.present(drawable)
+                      command.commit()
+                  }
+              }
+          }
+          SWIFT
+
+          cd probe
+          xcodegen generate
+
+      - name: Build and package IPA
+        run: |
+          xcodebuild \
+            -project probe/LegacyMetalProbe.xcodeproj \
+            -scheme LegacyMetalProbe \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/build" \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+          APP="$RUNNER_TEMP/build/Build/Products/Release-iphoneos/LegacyMetalProbe.app"
+          test -f "$APP/Info.plist"
+          test -f "$APP/LegacyMetalProbe"
+
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/ipa/Payload/"
+          cd "$RUNNER_TEMP/ipa"
+          zip -qry "$RUNNER_TEMP/LegacyMetalProbe.ipa" Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nxnative-legacy-metal-probe
+          path: ${{ runner.temp }}/LegacyMetalProbe.ipa
+          retention-days: 7
