@@ -1,0 +1,228 @@
+
+name: iOS 16 MetalFX Spatial Probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 20
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install XcodeGen
+        run: command -v xcodegen || brew install xcodegen
+
+      - name: Create MetalFX project
+        run: |
+          mkdir -p probe/Sources
+
+          cat > probe/project.yml <<'YAML'
+          name: MetalFXSpatialProbe
+          options:
+            deploymentTarget:
+              iOS: "16.0"
+          targets:
+            MetalFXSpatialProbe:
+              type: application
+              platform: iOS
+              sources:
+                - Sources
+              settings:
+                base:
+                  PRODUCT_BUNDLE_IDENTIFIER: org.nxnative.metalfx-spatial-probe
+                  SWIFT_VERSION: "5.0"
+                  TARGETED_DEVICE_FAMILY: "1,2"
+                  GENERATE_INFOPLIST_FILE: YES
+                  INFOPLIST_KEY_CFBundleDisplayName: "MetalFX Spatial Probe"
+                  CODE_SIGNING_ALLOWED: NO
+          YAML
+
+          cat > probe/Sources/Probe.swift <<'SWIFT'
+          import SwiftUI
+          import Metal
+          import MetalFX
+          import UIKit
+
+          @main
+          struct ProbeApp: App {
+              var body: some Scene {
+                  WindowGroup { ContentView() }
+              }
+          }
+
+          struct ContentView: View {
+              @State private var result = "Testing MetalFX Spatial..."
+
+              var body: some View {
+                  VStack(spacing: 16) {
+                      Text("MetalFX Spatial Probe")
+                          .font(.title.bold())
+
+                      Text("iOS: \(UIDevice.current.systemVersion)")
+                      Text("GPU: \(MTLCreateSystemDefaultDevice()?.name ?? "Unavailable")")
+
+                      Text(result)
+                          .font(.system(.body, design: .monospaced))
+                          .multilineTextAlignment(.center)
+
+                      Spacer()
+                  }
+                  .padding()
+                  .onAppear {
+                      DispatchQueue.global(qos: .userInitiated).async {
+                          let message = Self.runTest()
+                          DispatchQueue.main.async {
+                              result = message
+                          }
+                      }
+                  }
+              }
+
+              static func runTest() -> String {
+                  guard let device = MTLCreateSystemDefaultDevice() else {
+                      return "FAIL: Metal device unavailable"
+                  }
+
+                  guard MTLFXSpatialScalerDescriptor.supportsDevice(device) else {
+                      return "UNSUPPORTED: GPU reports no Spatial support"
+                  }
+
+                  let iw = 320
+                  let ih = 180
+                  let ow = 640
+                  let oh = 360
+
+                  let desc = MTLFXSpatialScalerDescriptor()
+                  desc.inputWidth = iw
+                  desc.inputHeight = ih
+                  desc.outputWidth = ow
+                  desc.outputHeight = oh
+                  desc.colorTextureFormat = .bgra8Unorm
+                  desc.outputTextureFormat = .bgra8Unorm
+                  desc.colorProcessingMode = .perceptual
+
+                  guard let scaler = desc.makeSpatialScaler(device: device) else {
+                      return "FAIL: scaler creation failed"
+                  }
+
+                  let inputDesc = MTLTextureDescriptor.texture2DDescriptor(
+                      pixelFormat: .bgra8Unorm,
+                      width: iw,
+                      height: ih,
+                      mipmapped: false
+                  )
+                  inputDesc.storageMode = .shared
+                  inputDesc.usage = scaler.colorTextureUsage.union(.renderTarget)
+
+                  let outputDesc = MTLTextureDescriptor.texture2DDescriptor(
+                      pixelFormat: .bgra8Unorm,
+                      width: ow,
+                      height: oh,
+                      mipmapped: false
+                  )
+                  outputDesc.storageMode = .shared
+                  outputDesc.usage = scaler.outputTextureUsage
+
+                  guard
+                      let input = device.makeTexture(descriptor: inputDesc),
+                      let output = device.makeTexture(descriptor: outputDesc),
+                      let queue = device.makeCommandQueue(),
+                      let command = queue.makeCommandBuffer()
+                  else {
+                      return "FAIL: texture or queue creation failed"
+                  }
+
+                  let pass = MTLRenderPassDescriptor()
+                  pass.colorAttachments[0].texture = input
+                  pass.colorAttachments[0].loadAction = .clear
+                  pass.colorAttachments[0].storeAction = .store
+                  pass.colorAttachments[0].clearColor = MTLClearColor(
+                      red: 0.05, green: 0.25, blue: 0.8, alpha: 1
+                  )
+
+                  guard let encoder = command.makeRenderCommandEncoder(
+                      descriptor: pass
+                  ) else {
+                      return "FAIL: input render pass creation failed"
+                  }
+
+                  encoder.endEncoding()
+
+                  scaler.colorTexture = input
+                  scaler.inputContentWidth = iw
+                  scaler.inputContentHeight = ih
+                  scaler.outputTexture = output
+                  scaler.encode(commandBuffer: command)
+
+                  command.commit()
+                  command.waitUntilCompleted()
+
+                  guard command.status == .completed else {
+                      return "FAIL: \(command.error?.localizedDescription ?? "GPU command failed")"
+                  }
+
+                  var pixels = [UInt8](repeating: 0, count: ow * oh * 4)
+
+                  pixels.withUnsafeMutableBytes { buffer in
+                      if let address = buffer.baseAddress {
+                          output.getBytes(
+                              address,
+                              bytesPerRow: ow * 4,
+                              from: MTLRegionMake2D(0, 0, ow, oh),
+                              mipmapLevel: 0
+                          )
+                      }
+                  }
+
+                  guard pixels.contains(where: { $0 != 0 }) else {
+                      return "FAIL: output texture is empty"
+                  }
+
+                  return """
+                  PASS: MetalFX Spatial executed
+                  320 x 180 -> 640 x 360
+                  Output texture contains data.
+                  """
+              }
+          }
+          SWIFT
+
+          cd probe
+          xcodegen generate
+
+      - name: Build and package IPA
+        run: |
+          xcodebuild \
+            -project probe/MetalFXSpatialProbe.xcodeproj \
+            -scheme MetalFXSpatialProbe \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/build" \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+          APP="$RUNNER_TEMP/build/Build/Products/Release-iphoneos/MetalFXSpatialProbe.app"
+          test -f "$APP/Info.plist"
+          test -f "$APP/MetalFXSpatialProbe"
+
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/ipa/Payload/"
+
+          cd "$RUNNER_TEMP/ipa"
+          zip -qry "$RUNNER_TEMP/MetalFXSpatialProbe.ipa" Payload
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nxnative-metalfx-spatial-probe
+          path: ${{ runner.temp }}/MetalFXSpatialProbe.ipa
+          retention-days: 7
